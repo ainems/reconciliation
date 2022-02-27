@@ -1,0 +1,109 @@
+set autocommit=on;
+drop view eagle_rec;
+create view eagle_rec as (
+
+with refunds as
+(SELECT 
+merchantreferencenumber,
+localizedrequestdate::date as refund_date,
+sum(cybersource_transactions_v.amount) over (partition by merchantreferencenumber) as amount_refund
+FROM cybersource_transactions_v 
+where applicationname like '%ics_credit%' and rflag like '%SOK%'
+),
+
+p as (
+select
+product_id,
+case when product_id like 'urn:hmk:shipping:couriers:usps%'then right(product_id,36) else null end as usps_id,
+order_id
+from staging.line_items 
+where product_id like '%usps:codes%'
+group by product_id, order_id
+),
+
+--Get unique mrns and match to internal order numbers, zipcode, state
+c as (
+select
+ct.merchantreferencenumber,
+merchantdefineddatafield3
+from asandfort.cybersource_transactions_v ctv
+left join (
+select
+merchantdefineddatafield3,
+ct.merchantreferencenumber
+from asandfort.cybersource_transactions c
+inner join 
+(select 
+distinct merchantreferencenumber 
+from asandfort.cybersource_transactions) ct 
+on c.merchantreferencenumber = ct.merchantreferencenumber
+where merchantdefineddatafield3 like '%-%'
+group by ct.merchantreferencenumber, c.merchantdefineddatafield3
+) ct
+on ct.merchantreferencenumber = ctv.merchantreferencenumber
+where merchantdefineddatafield3 like '%-%'
+group by ct.merchantreferencenumber,
+merchantdefineddatafield3
+)
+
+select
+convert_timezone('utc','pst',o.order_date) as paid_datetime,
+vc.localizedrequestdate as cybersource_date,
+
+case
+  when o.public_order_number like 'eagle%' then 'eagle'
+  when o.public_order_number like 'pod%' then 'pod'
+  else null
+  end as vertical,
+
+o.internal_order_number,
+o.public_order_number,
+
+r.status,
+r.state,
+
+
+c.merchantreferencenumber,
+sum(vc.amount) over (partition by vc.merchantreferencenumber) as amount_paid,
+vc.billto_zip,
+vc.billto_state,
+
+
+case when len(refunds.refund_date) > 4 then refunds.refund_date else null end as refund_date,
+refunds.amount_refund,
+case when len(refunds.refund_date) > 4 then 1 else 0 end as refund_flag,
+
+
+p.usps_id,
+
+a.postal_code,
+
+
+i.code,
+
+o.is_test,
+o.total,
+case when o.email like lower('%hallmark%') or o.email like '%+%' or o.email like '%valuestreamengineers%' or o.email like '%wdlevyre%' then 1 else 0 end as is_hallmark
+
+from
+staging.orders o
+
+left join p on p.order_id = o.id
+left join staging.line_items l on o.id = l.order_id
+left join staging.recipients r on l.id = r.line_item_id
+left join asandfort.shipping_db_dump i on i.public_id = p.usps_id
+left join c on o.internal_order_number = c.merchantdefineddatafield3
+left join cybersource_transactions vc on o.internal_order_number = vc.merchantdefineddatafield3
+left join refunds on c.merchantreferencenumber = refunds.merchantreferencenumber
+left join staging.recipients ar on ar.line_item_id = l.id
+--join addresses with recipients to get recipient zipcode
+left join staging.addresses a on ar.address_id = a.id
+--where o.vertical_id = '33' 
+
+group by public_order_number, o.order_date, o.internal_order_number, c.merchantreferencenumber,
+p.usps_id, i.code, refunds.refund_date, vc.billto_zip,
+vc.billto_state, vc.merchantreferencenumber,o.is_test, o.email, o.total, vc.amount, refunds.amount_refund, r.state,r.status,c.merchantdefineddatafield3, applicationname, rflag, a.postal_code,
+vc.merchantdefineddatafield3, vc.localizedrequestdate
+
+
+)
